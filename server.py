@@ -8,6 +8,9 @@ Joern MCP Server.
 
 import asyncio
 import json
+import os
+import subprocess
+import tempfile
 import urllib.request
 import urllib.error
 from typing import Any
@@ -19,8 +22,31 @@ from mcp import types
 JOERN_BASE   = "http://localhost:8080"
 TIMEOUT      = 120   # секунды — большие проекты требуют времени
 MAX_RESULT   = 8000  # символы — ограничение, чтобы не забивать контекст
+JOERN_PARSE  = os.environ.get("JOERN_PARSE", "joern-parse")
+
+# Явные frontend'ы Joern (--language). Без language importCode угадывает по типу файлов.
+LANGUAGES = [
+    "JAVASRC", "JAVA", "JAVASCRIPT", "PHP", "PYTHONSRC",
+    "CSHARPSRC", "GOLANG", "KOTLIN", "RUBYSRC", "SWIFTSRC", "C",
+]
 
 app = Server("joern-mcp")
+
+
+def build_cpg(path: str, language: str, frontend_args: str = "") -> str:
+    """Явно собрать CPG через joern-parse --language. Возвращает путь к cpg.bin."""
+    out_dir = tempfile.mkdtemp(prefix="joern_cpg_")
+    cpg = os.path.join(out_dir, "cpg.bin")
+    cmd = [JOERN_PARSE, path, "--language", language, "-o", cpg]
+    if frontend_args:
+        cmd += ["--frontend-args", *frontend_args.split()]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+    if not os.path.isfile(cpg):
+        raise RuntimeError(
+            f"joern-parse ({language}) не создал CPG. "
+            f"{((proc.stderr or proc.stdout) or '').strip()[:1500]}"
+        )
+    return cpg
 
 
 def joern_exec(query: str) -> dict:
@@ -84,9 +110,11 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="joern_load",
             description=(
-                "Load source code and build a CPG. "
-                "Supports PHP, Java, JS, Python, C/C++ etc. "
-                "Use absolute paths. Large projects may take 1-2 minutes."
+                "Load source code and build a CPG. Supports PHP, Java (JAVASRC), "
+                "JavaScript/TypeScript (JAVASCRIPT), Python, C/C++, Kotlin, C#, Go, Ruby, Swift. "
+                "Use absolute paths. Large projects may take 1-2 minutes. "
+                "Pass language to force a frontend (recommended; auto-detection can pick the "
+                "wrong frontend on mixed or TS-heavy projects)."
             ),
             inputSchema={
                 "type": "object",
@@ -98,6 +126,16 @@ async def list_tools() -> list[types.Tool]:
                     "project_name": {
                         "type": "string",
                         "description": "Optional name for this project in workspace",
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": LANGUAGES,
+                        "description": "Force a Joern frontend via joern-parse --language "
+                        "(JAVASRC for Java, JAVASCRIPT for JS/TS).",
+                    },
+                    "frontend_args": {
+                        "type": "string",
+                        "description": "Extra frontend args, e.g. '--no-tsTypes' for JAVASCRIPT.",
                     },
                 },
                 "required": ["path"],
@@ -127,6 +165,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         elif name == "joern_load":
             path = arguments["path"]
             proj = arguments.get("project_name", "")
+            language = arguments.get("language")
+            frontend_args = arguments.get("frontend_args", "")
+            if language:
+                try:
+                    cpg = await loop.run_in_executor(
+                        None, build_cpg, path, language, frontend_args)
+                except Exception as e:
+                    return [types.TextContent(type="text", text=f"[ERROR] {e}")]
+                result = await loop.run_in_executor(None, joern_exec, f'importCpg("{cpg}")')
+                return [types.TextContent(type="text", text=
+                    format_result(result) + f"\n\n[built with --language {language}]")]
             if proj:
                 query = f'importCode("{path}", "{proj}")'
             else:
